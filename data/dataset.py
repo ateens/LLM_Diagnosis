@@ -200,7 +200,11 @@ class VibrationDataset(Dataset):
 
         # ---- current segment ----
         x_vib = self._extract_segment(row_idx, start)
-        x_stft = self.transform(x_vib, sr=sr, rpm=float(row["rpm"]))
+        # transform이 None이 아닐 때만 STFT 변환 수행
+        if self.transform is not None:
+            x_stft = self.transform(x_vib, sr=sr, rpm=float(row["rpm"]))
+        else:
+            x_stft = None  # feature_extract.py에서는 x_vib만 사용하므로 x_stft 불필요
         class_idx = self.class_list.index(row['merged_class'])
         x_cls = torch.tensor(class_idx ,dtype=torch.long)
 
@@ -233,7 +237,11 @@ class VibrationDataset(Dataset):
                 ref_sr = ref_meta["sr"]
                 
                 ref_vib = self._extract_segment(ref_row_idx, ref_start)
-                ref_stft = self.transform(ref_vib, sr=ref_sr, rpm=float(ref_row["rpm"]))
+                # transform이 None이 아닐 때만 STFT 변환 수행
+                if self.transform is not None:
+                    ref_stft = self.transform(ref_vib, sr=ref_sr, rpm=float(ref_row["rpm"]))
+                else:
+                    ref_stft = None  # feature_extract.py에서는 ref_vib만 사용하므로 ref_stft 불필요
                 tensor_cls_norm = torch.tensor(self.class_list.index('normal'), dtype=torch.long)
                 ref_info = {
                     "sampling_rate": float(ref_sr),

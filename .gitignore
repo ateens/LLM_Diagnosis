@@ -1,5 +1,6 @@
 data/__pycache__/
 data/processed/
+data/dataset/
 models/__pycache__/
 utils/__pycache__/
 cache_models/
@@ -23,3 +24,6 @@ llm_cache/
 reference.py
 log_output/
 inference_outputs/
+docs_path/
+main.py
+*.md
