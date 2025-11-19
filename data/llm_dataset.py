@@ -409,17 +409,34 @@ def retrieve_documents(
     # retriever의 k 값을 가져오기
     original_k = retriever.search_kwargs.get('k', 4) if hasattr(retriever, 'search_kwargs') else 4
     
-    # k + 3개를 검색하도록 임시로 k 증가
-    if hasattr(retriever, 'search_kwargs'):
-        original_search_kwargs = retriever.search_kwargs.copy()
-        retriever.search_kwargs['k'] = original_k + 3
+    # k + 3개를 검색하기 위해 vectorstore에 직접 접근
+    # retriever.vectorstore 또는 retriever._vectorstore 속성 사용
+    vectorstore = None
+    if hasattr(retriever, 'vectorstore'):
+        vectorstore = retriever.vectorstore
+    elif hasattr(retriever, '_vectorstore'):
+        vectorstore = retriever._vectorstore
     
-    try:
-        retrieved_docs = retriever.invoke(query)
-    finally:
-        # 원래 search_kwargs 복원
-        if hasattr(retriever, 'search_kwargs'):
-            retriever.search_kwargs = original_search_kwargs
+    if vectorstore is not None:
+        # vectorstore에서 직접 더 많은 문서 검색 (MMR 사용)
+        retrieved_docs = vectorstore.max_marginal_relevance_search(
+            query=query,
+            k=original_k + 3,
+            fetch_k=(original_k + 3) * 2,
+            lambda_mult=0.5
+        )
+    else:
+        # fallback: get_relevant_documents 사용 (k 파라미터 지원 여부 확인)
+        if hasattr(retriever, 'get_relevant_documents'):
+            try:
+                # k 파라미터를 전달해보고, 안 되면 기본 호출
+                retrieved_docs = retriever.get_relevant_documents(query, k=original_k + 3)
+            except TypeError:
+                # k 파라미터를 지원하지 않으면 기본 호출
+                retrieved_docs = retriever.get_relevant_documents(query)
+        else:
+            # 최종 fallback: invoke 사용
+            retrieved_docs = retriever.invoke(query)
     
     # 중복 제거: 소스 파일 + 청크 인덱스 조합으로 중복 제거
     seen_keys = set()
@@ -587,7 +604,7 @@ class LLM_Dataset(Dataset):
         self.target_labels = target_labels
         
         self.feature_dataset = FeatureExtractLLMDataset(vibration_dataset=vibration_dataset)
-    
+        
     def __len__(self):
         return len(self.vibration_dataset)
 
