@@ -27,3 +27,5 @@ inference_outputs/
 docs_path/
 main.py
 *.md
+count_chunks.py
+inspect_rag_docs.py

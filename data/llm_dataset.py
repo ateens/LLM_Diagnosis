@@ -38,29 +38,16 @@ def format_docs(docs):
         
         return " | ".join(parts) if parts else "일반 텍스트"
     
-    def _summarize_text(text, max_words=100, max_chars=500):
-        """텍스트 요약"""
-        words = text.split()
-        if len(words) > max_words:
-            summary = " ".join(words[:50]) + " ... [중략] ... " + " ".join(words[-50:])
-        else:
-            summary = text
-        
-        if len(summary) > max_chars:
-            summary = summary[:200] + " ... [중략] ... " + summary[-200:]
-        return summary
-    
     lines = []
     for idx, doc in enumerate(docs, 1):
         meta = getattr(doc, "metadata", {}) if hasattr(doc, "metadata") else {}
         text = getattr(doc, "page_content", str(doc))
         
         section_info = _get_section_info(meta)
-        summary = _summarize_text(text)
         
         lines.append(f"[DOC{idx}] {meta.get('source', 'unknown')} "
-                     f"(청크 {meta.get('chunk_index', idx - 1)}, {section_info}): {summary}")
-    return "\n".join(lines)
+                     f"(청크 {meta.get('chunk_index', idx - 1)}, {section_info}):\n{text}")
+    return "\n\n".join(lines)
 
 
 class LLM_Dataset(Dataset):
@@ -69,9 +56,11 @@ class LLM_Dataset(Dataset):
     
     __getitem__에서 다음을 반환:
     - cur_status: 변화율 딕셔너리
+    - x_feat: 현재 상태 특징 딕셔너리
+    - ref_feat: 참조 상태 특징 딕셔너리 (있을 경우)
     - rag_docs: Document 객체 리스트
-    - rag_docs_formatted: 포맷된 문자열
-    - user_prompt: VibrationSFTDataset 형식의 프롬프트 (Planner.plan() 내용 기반)
+    - prompt: 전체 프롬프트 (System + User + Assistant)
+    
     """
     
     def __init__(self,
@@ -203,16 +192,6 @@ class LLM_Dataset(Dataset):
         
         Returns:
             dict: {
-                # 원본 VibrationDataset 데이터
-                'x_vib': 현재 상태 진동 데이터,
-                'x_stft': 현재 상태 STFT (있을 경우),
-                'x_info': 현재 상태 정보 딕셔너리,
-                'x_cls': 현재 상태 클래스 인덱스,
-                'ref_vib': 참조 상태 진동 데이터 (있을 경우),
-                'ref_stft': 참조 상태 STFT (있을 경우),
-                'ref_info': 참조 상태 정보 딕셔너리 (있을 경우),
-                'ref_cls': 참조 상태 클래스 인덱스 (있을 경우),
-                
                 # 특징 추출 결과
                 'cur_status': 변화율 딕셔너리,
                 'x_feat': 현재 상태 특징 딕셔너리,
@@ -220,14 +199,12 @@ class LLM_Dataset(Dataset):
                 
                 # RAG 검색 결과
                 'rag_docs': Document 객체 리스트,
-                'rag_docs_formatted': 포맷된 문자열,
                 
                 # 프롬프트
-                'user_prompt': User 프롬프트만,
                 'prompt': 전체 프롬프트 (System + User + Assistant)
             }
         """
-        # 원본 데이터 및 특징 추출
+        # 원본 데이터 특징 추출
         data_dict = self.vibration_dataset[index]
         feature_sample = self.feature_dataset[index]
         
@@ -239,13 +216,10 @@ class LLM_Dataset(Dataset):
         
         # 결과 딕셔너리 구성
         return {
-            **data_dict,  # 원본 VibrationDataset 데이터
             'cur_status': cur_status,
             'x_feat': feature_sample.get('x_feat', {}),
             'ref_feat': feature_sample.get('ref_feat', None),
             'rag_docs': rag_docs,
-            'rag_docs_formatted': rag_docs_formatted,
-            'user_prompt': prompt,
             'prompt': prompt
         }
 
