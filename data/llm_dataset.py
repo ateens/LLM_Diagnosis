@@ -1,8 +1,9 @@
 import os
 import sys
+import re
+import shutil
 from typing import Optional, Dict, List, Any
 from torch.utils.data import Dataset
-import numpy as np
 
 # 프로젝트 루트를 sys.path에 추가 (data 디렉토리에서 실행할 때를 위해)
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -16,8 +17,516 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 REBUILD_VECTORSTORE = False
 
 from data.dataset import VibrationDataset
-from legacy.GRPO_trainer.vllm_dataset import Planner, make_retriever
 from feature_extract import LLM_Dataset as FeatureExtractLLMDataset
+
+# LangChain imports
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document
+
+
+class SemanticTextSplitter:
+    """
+    문서 구조 기반 semantic text splitter
+    Chapter, Section, Subsection 단위로 문서를 분할
+    """
+    
+    def __init__(self, chunk_size=1000, chunk_overlap=200, min_chunk_size=100):
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.min_chunk_size = min_chunk_size
+        
+        # 문서 구조 패턴 정의
+        self.patterns = {
+            'chapter': re.compile(r'^Chapter\s+(\d+(?:\.\d+)?)\s+(.+)$', re.MULTILINE | re.IGNORECASE),
+            'section': re.compile(r'^(\d+\.\d+)\s+(.+)$', re.MULTILINE),
+            'subsection': re.compile(r'^(\d+\.\d+\.\d+)\s+(.+)$', re.MULTILINE),
+            'table': re.compile(r'^Table\s+(\d+(?:\.\d+)?)\s+(.+)$', re.MULTILINE | re.IGNORECASE),
+            'figure': re.compile(r'^Figure\s+(\d+(?:\.\d+)?)\s+(.+)$', re.MULTILINE | re.IGNORECASE),
+        }
+    
+    def _parse_structure(self, text):
+        """문서 구조 파싱 - Chapter, Section, Subsection 위치 찾기"""
+        structure = []
+        lines = text.split('\n')
+        
+        current_chapter = None
+        current_section = None
+        current_subsection = None
+        
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            
+            # Chapter 검사
+            chapter_match = self.patterns['chapter'].match(line_stripped)
+            if chapter_match:
+                current_chapter = {
+                    'type': 'chapter',
+                    'number': chapter_match.group(1),
+                    'title': chapter_match.group(2).strip(),
+                    'line': i,
+                    'content_start': i
+                }
+                current_section = None
+                current_subsection = None
+                structure.append(current_chapter)
+                continue
+            
+            # Section 검사
+            section_match = self.patterns['section'].match(line_stripped)
+            if section_match:
+                current_section = {
+                    'type': 'section',
+                    'number': section_match.group(1),
+                    'title': section_match.group(2).strip(),
+                    'line': i,
+                    'content_start': i,
+                    'chapter': current_chapter['number'] if current_chapter else None
+                }
+                current_subsection = None
+                structure.append(current_section)
+                continue
+            
+            # Subsection 검사
+            subsection_match = self.patterns['subsection'].match(line_stripped)
+            if subsection_match:
+                current_subsection = {
+                    'type': 'subsection',
+                    'number': subsection_match.group(1),
+                    'title': subsection_match.group(2).strip(),
+                    'line': i,
+                    'content_start': i,
+                    'chapter': current_chapter['number'] if current_chapter else None,
+                    'section': current_section['number'] if current_section else None
+                }
+                structure.append(current_subsection)
+                continue
+            
+            # Table 검사
+            table_match = self.patterns['table'].match(line_stripped)
+            if table_match:
+                structure.append({
+                    'type': 'table',
+                    'number': table_match.group(1),
+                    'title': table_match.group(2).strip(),
+                    'line': i,
+                    'content_start': i,
+                    'chapter': current_chapter['number'] if current_chapter else None,
+                    'section': current_section['number'] if current_section else None
+                })
+                continue
+            
+            # Figure 검사
+            figure_match = self.patterns['figure'].match(line_stripped)
+            if figure_match:
+                structure.append({
+                    'type': 'figure',
+                    'number': figure_match.group(1),
+                    'title': figure_match.group(2).strip(),
+                    'line': i,
+                    'content_start': i,
+                    'chapter': current_chapter['number'] if current_chapter else None,
+                    'section': current_section['number'] if current_section else None
+                })
+                continue
+        
+        return structure
+    
+    def split_documents(self, documents):
+        """Document 리스트를 구조 기반으로 분할"""
+        all_chunks = []
+        
+        for doc_idx, doc in enumerate(documents):
+            text = doc.page_content
+            source = doc.metadata.get('source', 'unknown')
+            
+            # 문서 구조 파싱
+            structure = self._parse_structure(text)
+            lines = text.split('\n')
+            
+            if not structure:
+                # 구조가 없으면 RecursiveCharacterTextSplitter 사용
+                fallback_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=self.chunk_size,
+                    chunk_overlap=self.chunk_overlap
+                )
+                chunks = fallback_splitter.split_documents([doc])
+                for chunk_idx, chunk in enumerate(chunks):
+                    chunk.metadata.update({
+                        'chunk_index': chunk_idx,
+                        'chapter': None,
+                        'section': None,
+                        'content_type': 'text',
+                        'char_start': text.find(chunk.page_content),
+                        'char_end': text.find(chunk.page_content) + len(chunk.page_content)
+                    })
+                all_chunks.extend(chunks)
+                continue
+            
+            # 구조 기반 분할
+            for struct_idx, struct in enumerate(structure):
+                # 현재 구조 요소의 시작 라인
+                start_line = struct['line']
+                
+                # 다음 구조 요소의 시작 라인 (또는 문서 끝)
+                if struct_idx + 1 < len(structure):
+                    end_line = structure[struct_idx + 1]['line']
+                else:
+                    end_line = len(lines)
+                
+                # 해당 구간의 텍스트 추출
+                section_lines = lines[start_line:end_line]
+                section_text = '\n'.join(section_lines).strip()
+                
+                if len(section_text) < self.min_chunk_size:
+                    continue
+                
+                # 청크가 너무 크면 RecursiveCharacterTextSplitter로 재분할
+                if len(section_text) > self.chunk_size:
+                    temp_doc = Document(
+                        page_content=section_text,
+                        metadata={'source': source}
+                    )
+                    fallback_splitter = RecursiveCharacterTextSplitter(
+                        chunk_size=self.chunk_size,
+                        chunk_overlap=self.chunk_overlap
+                    )
+                    sub_chunks = fallback_splitter.split_documents([temp_doc])
+                    
+                    for sub_idx, sub_chunk in enumerate(sub_chunks):
+                        char_start = text.find(sub_chunk.page_content)
+                        sub_chunk.metadata.update({
+                            'chunk_index': len(all_chunks) + sub_idx,
+                            'chapter': struct.get('chapter'),
+                            'section': struct.get('section'),
+                            'subsection': struct.get('number') if struct['type'] == 'subsection' else None,
+                            'content_type': struct['type'],
+                            'struct_number': struct.get('number'),
+                            'struct_title': struct.get('title'),
+                            'char_start': char_start if char_start >= 0 else 0,
+                            'char_end': char_start + len(sub_chunk.page_content) if char_start >= 0 else len(sub_chunk.page_content)
+                        })
+                    all_chunks.extend(sub_chunks)
+                else:
+                    # 청크 크기가 적절하면 그대로 사용
+                    char_start = text.find(section_text)
+                    chunk = Document(
+                        page_content=section_text,
+                        metadata={
+                            'source': source,
+                            'chunk_index': len(all_chunks),
+                            'chapter': struct.get('chapter'),
+                            'section': struct.get('section'),
+                            'subsection': struct.get('number') if struct['type'] == 'subsection' else None,
+                            'content_type': struct['type'],
+                            'struct_number': struct.get('number'),
+                            'struct_title': struct.get('title'),
+                            'char_start': char_start if char_start >= 0 else 0,
+                            'char_end': char_start + len(section_text) if char_start >= 0 else len(section_text)
+                        }
+                    )
+                    all_chunks.append(chunk)
+        
+        return all_chunks
+
+
+def retrieve_documents(
+    retriever,
+    current_knowledge: Dict[str, float],
+    target_labels: str = "normal(healthy), misalignment, looseness, unbalance, bearing fault"
+) -> List[Document]:
+    """
+    큰 변화율과 비정상 지표에 집중한 검색 쿼리 생성 및 문서 검색
+    
+    Args:
+        retriever: 벡터 검색기
+        current_knowledge: 정상 상태 대비 변화율(%) 딕셔너리
+            - 형식: {'rms_x': 3622.7905, 'kurtosis_x': -71.4348, ...}
+            - 양수: 정상보다 증가 (예: 316.26% = 정상 대비 316% 증가)
+            - 음수: 정상보다 감소 (예: -75.28% = 정상 대비 75% 감소)
+            - 변화율 = (현재값 - 정상값) / 정상값 * 100
+            - 0이 아닌 값만 포함됨 (feature_extract.py에서 필터링됨)
+        target_labels: 진단 대상 레이블 문자열
+    
+    Returns:
+        검색된 Document 객체 리스트
+    """
+    def classify_changes(change_rates, threshold_extreme=50.0, threshold_large=20.0, threshold_moderate=10.0):
+        """변화율을 극단/큰/중간으로 분류하고 절댓값 기준 내림차순 정렬"""
+        sorted_changes = sorted(
+            change_rates.items(),
+            key=lambda x: abs(x[1]),
+            reverse=True
+        )
+        
+        extreme_features = []  # 극단적 변화 (>=50%)
+        large_features = []     # 큰 변화 (20-50%)
+        moderate_features = []  # 중간 변화 (10-20%)
+        
+        for feature, change_rate in sorted_changes:
+            abs_rate = abs(change_rate)
+            if abs_rate >= threshold_extreme:
+                extreme_features.append((feature, change_rate))
+            elif abs_rate >= threshold_large:
+                large_features.append((feature, change_rate))
+            elif abs_rate >= threshold_moderate:
+                moderate_features.append((feature, change_rate))
+        
+        return extreme_features, large_features, moderate_features
+    
+    # 변화율 직접 사용 (이미 딕셔너리 형식이고 필터링됨)
+    change_rates = current_knowledge if isinstance(current_knowledge, dict) else {}
+    
+    # 변화율 분류
+    extreme_features, large_features, moderate_features = classify_changes(change_rates)
+    
+    # 고장 유형별 중요 특징 매핑 테이블
+    fault_critical_features = {
+        "misalignment": {
+            "primary": ["order_x_2x", "order_y_2x", "order_x_1x", "order_y_1x"],
+            "secondary": ["rms_x", "rms_y", "peak_freq_x", "peak_freq_y", "peak2peak_x", "peak2peak_y"]
+        },
+        "unbalance": {
+            "primary": ["order_x_1x", "order_y_1x", "rms_x", "rms_y"],
+            "secondary": ["peak_freq_x", "peak_freq_y", "peak2peak_x", "peak2peak_y", "peak_abs_x", "peak_abs_y"]
+        },
+        "looseness": {
+            "primary": ["kurtosis_x", "kurtosis_y", "crest_factor_x", "crest_factor_y", 
+                       "order_x_3x", "order_y_3x"],
+            "secondary": ["skewness_x", "skewness_y", "peak2peak_x", "peak2peak_y", "var_x", "var_y"]
+        },
+        "bearing fault": {
+            "primary": ["order_x_2x", "order_x_3x", "order_y_2x", "order_y_3x",
+                       "peak_freq_x", "peak_freq_y"],
+            "secondary": ["rms_freq_x", "rms_freq_y", "center_freq_x", "center_freq_y", 
+                         "bpfo_peak_x", "bpfi_peak_x"]
+        }
+    }
+    
+    # 가중치 기반 고장 유형 추론
+    fault_scores = {}
+    all_abnormal_features = extreme_features + large_features
+    
+    for fault_type, features in fault_critical_features.items():
+        score = 0.0
+        # Primary 특징에 더 높은 가중치 (2.0)
+        for feat_name, change_rate in all_abnormal_features:
+            if feat_name in features["primary"]:
+                score += abs(change_rate) * 2.0
+            elif feat_name in features["secondary"]:
+                score += abs(change_rate) * 1.0
+        
+        if score > 0:
+            fault_scores[fault_type] = score
+    
+    # 점수가 높은 상위 2개 고장 유형 선택
+    suspected_faults = []
+    if fault_scores:
+        sorted_faults = sorted(fault_scores.items(), key=lambda x: x[1], reverse=True)
+        suspected_faults = [fault for fault, score in sorted_faults[:2]]
+    
+    # 고장 유형별 키워드 매핑
+    fault_keywords = {
+        "misalignment": ["2x harmonic", "second harmonic", "misalignment", "axial", "radial"],
+        "unbalance": ["1x harmonic", "first harmonic", "unbalance", "rotational"],
+        "looseness": ["3x harmonic", "looseness", "impact", "shock", "kurtosis", "crest factor"],
+        "bearing fault": ["bearing", "BPFO", "BPFI", "ball pass", "inner race", "outer race"],
+    }
+    
+    # 검색 쿼리 생성 (비정상 특징 강조)
+    query_parts = [
+        "vibration diagnosis rotating machinery",
+        f"diagnostic methods classify {target_labels}",
+    ]
+    
+    # 극단적 변화 특징 강조
+    if extreme_features:
+        extreme_feat_names = [f[0] for f in extreme_features[:5]]  # 상위 5개
+        query_parts.append("CRITICAL abnormal features")
+        query_parts.extend(extreme_feat_names)
+        query_parts.append("extreme deviation from normal")
+    
+    # 큰 변화 특징 포함
+    if large_features:
+        large_feat_names = [f[0] for f in large_features[:5]]
+        query_parts.append("significant changes")
+        query_parts.extend(large_feat_names)
+    
+    # 추론된 고장 유형 키워드 추가
+    if suspected_faults:
+        for fault in suspected_faults:
+            query_parts.extend(fault_keywords.get(fault, []))
+    else:
+        # 모든 고장 유형 키워드 포함 (다양성 확보)
+        for keywords in fault_keywords.values():
+            query_parts.extend(keywords[:2])
+    
+    # 특징 기반 키워드 추가
+    query_parts.extend([
+        "order spectrum analysis",
+        "RMS vibration",
+        "kurtosis",
+        "crest factor",
+        "frequency domain",
+        "harmonic components",
+        "ISO 7919",
+        "ISO 10816",
+        "diagnostic thresholds"
+    ])
+    
+    # 최종 쿼리 구성
+    base_query = " ".join(query_parts)
+    
+    # 비정상 특징 요약 생성
+    abnormal_summary = []
+    if extreme_features:
+        extreme_summary = ", ".join([f"{f[0]}={f[1]:.1f}%" for f in extreme_features[:3]])
+        abnormal_summary.append(f"EXTREME changes (>50%): {extreme_summary}")
+    if large_features:
+        large_summary = ", ".join([f"{f[0]}={f[1]:.1f}%" for f in large_features[:3]])
+        abnormal_summary.append(f"LARGE changes (20-50%): {large_summary}")
+    
+    # current_knowledge를 문자열로 변환 (표시용)
+    if isinstance(current_knowledge, dict):
+        knowledge_str = ", ".join([f"{k}: {v:.4f}" for k, v in list(current_knowledge.items())[:20]])
+    else:
+        knowledge_str = str(current_knowledge)[:400]
+    
+    query = (
+        f"{base_query}. "
+        f"Focus on abnormal indicators with significant deviation from normal baseline. "
+        f"{' '.join(abnormal_summary)}. "
+        f"Current vibration state (change rates % from normal baseline): {knowledge_str}. "
+        "Note: Change rates show percentage deviation from normal state. "
+        "Positive values indicate increase from normal, negative values indicate decrease. "
+        "For example, order_x_2x: 316% means the 2nd harmonic component is 316% higher than normal. "
+        "Provide diagnostic criteria, thresholds, and classification methods specifically for these abnormal features."
+    )
+    
+    # retriever의 k 값을 가져오기
+    original_k = retriever.search_kwargs.get('k', 4) if hasattr(retriever, 'search_kwargs') else 4
+    
+    # k + 3개를 검색하도록 임시로 k 증가
+    if hasattr(retriever, 'search_kwargs'):
+        original_search_kwargs = retriever.search_kwargs.copy()
+        retriever.search_kwargs['k'] = original_k + 3
+    
+    try:
+        retrieved_docs = retriever.invoke(query)
+    finally:
+        # 원래 search_kwargs 복원
+        if hasattr(retriever, 'search_kwargs'):
+            retriever.search_kwargs = original_search_kwargs
+    
+    # 중복 제거: 소스 파일 + 청크 인덱스 조합으로 중복 제거
+    seen_keys = set()
+    unique_docs = []
+    
+    for doc in retrieved_docs:
+        meta = getattr(doc, "metadata", {}) if hasattr(doc, "metadata") else {}
+        source = meta.get('source', 'unknown')
+        chunk_idx = meta.get('chunk_index', -1)
+        
+        # 소스 파일과 청크 인덱스 조합으로 중복 판단
+        key = (source, chunk_idx)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_docs.append(doc)
+            # 원래 k개가 모이면 중단
+            if len(unique_docs) >= original_k:
+                break
+    
+    # 정확히 k개 반환 (부족하면 그대로 반환)
+    return unique_docs[:original_k]
+
+
+def make_retriever(
+    embedding_model: str,
+    model_cache: str,
+    docs_path: str,
+    retriever_k: int,
+    rebuild: bool = False
+):
+    """
+    벡터 스토어와 retriever 생성
+    
+    Args:
+        embedding_model: 임베딩 모델명
+        model_cache: 모델 캐시 경로
+        docs_path: 문서 경로
+        retriever_k: 검색할 문서 수
+        rebuild: True면 기존 벡터 스토어 삭제 후 재생성, False면 기존 것 재사용
+    
+    Returns:
+        Retriever 객체
+    """
+    persist_directory = os.path.join(docs_path, "vectorstore")
+    
+    # 임베딩 모델 로딩 (재사용 시에도 필요)
+    embeddings = HuggingFaceEmbeddings(
+        model_name=embedding_model,
+        encode_kwargs={"normalize_embeddings": True},
+        cache_folder=model_cache
+    )
+    
+    # 기존 벡터 스토어가 있고 rebuild=False면 재사용
+    if os.path.exists(persist_directory) and not rebuild:
+        print(f"기존 벡터 스토어 로드 중: {persist_directory}")
+        vectorstore = Chroma(
+            persist_directory=persist_directory,
+            embedding_function=embeddings
+        )
+        print(f"벡터 스토어 로드 완료 (기존 DB 사용)")
+    else:
+        # 기존 벡터 스토어 삭제 (rebuild=True이거나 기존 DB가 없는 경우)
+        if os.path.exists(persist_directory):
+            print(f"기존 벡터 스토어 삭제 중: {persist_directory}")
+            shutil.rmtree(persist_directory)
+        
+        # docs_path 폴더에 있는 TXT 파일들을 불러오기
+        txt_files = [os.path.join(docs_path, f) for f in os.listdir(docs_path) if f.lower().endswith('.txt')]
+        if not txt_files:
+            raise ValueError(f"docs_path에 .txt 파일이 없습니다: {docs_path}")
+        
+        raw_docs = []
+        for path in txt_files:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                text = f.read()
+                raw_docs.append(Document(
+                    page_content=text,
+                    metadata={'source': os.path.basename(path)}
+                ))
+        
+        print(f"로드된 문서 수: {len(raw_docs)}")
+        
+        # SemanticTextSplitter로 문서 구조 기반 분할 (메타데이터 강화 포함)
+        text_splitter = SemanticTextSplitter(chunk_size=1000, chunk_overlap=200)
+        docs = text_splitter.split_documents(raw_docs)
+        print(f"생성된 청크 수: {len(docs)}")
+        
+        # VectorDB에 문서 저장
+        print("벡터 스토어 생성 중...")
+        vectorstore = Chroma.from_documents(
+            documents=docs,
+            embedding=embeddings,
+            persist_directory=persist_directory
+        )
+        print(f"벡터 스토어 저장 완료: {persist_directory}")
+    
+    # MMR 검색을 사용하여 Retriever 생성 (검색 다양성 향상)
+    retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={
+            "k": retriever_k,
+            "fetch_k": retriever_k * 3,  # 다양성 확보를 위해 더 많은 후보 검색
+            "lambda_mult": 0.5  # 유사도와 다양성 균형 (0.0=다양성, 1.0=유사도)
+        }
+    )
+    
+    return retriever
 
 
 def format_docs(docs):
@@ -70,7 +579,7 @@ class LLM_Dataset(Dataset):
         """
         Args:
             vibration_dataset: VibrationDataset 인스턴스
-            retriever: 벡터 검색기 (Planner.retrieve()에서 사용)
+            retriever: 벡터 검색기
             target_labels: 진단 대상 레이블 문자열
         """
         self.vibration_dataset = vibration_dataset
@@ -78,22 +587,12 @@ class LLM_Dataset(Dataset):
         self.target_labels = target_labels
         
         self.feature_dataset = FeatureExtractLLMDataset(vibration_dataset=vibration_dataset)
-        
-        # Planner 인스턴스 생성 (retrieve만 사용하므로 더미 객체 사용)
-        from unittest.mock import Mock
-        self.planner = Planner(
-            tokenizer=Mock(),
-            llm=Mock(),
-            retriever=retriever,
-            max_tokens=4096,
-            device="cpu"
-        )
-        
+    
     def __len__(self):
         return len(self.vibration_dataset)
 
     def _create_prompt(self, current_knowledge: Dict[str, float], rag_docs_formatted: str) -> str:
-        """Planner.plan()의 프롬프트 내용을 VibrationSFTDataset 형식으로 변환"""
+        """프롬프트 생성"""
         # 변화율 딕셔너리를 문자열로 변환
         knowledge_str = "\n".join([f"{k}: {v:.4f}" for k, v in current_knowledge.items()]) \
             if isinstance(current_knowledge, dict) else str(current_knowledge)
@@ -210,7 +709,7 @@ class LLM_Dataset(Dataset):
         
         # RAG 검색 및 프롬프트 생성
         cur_status = feature_sample.get('cur_status', {})
-        rag_docs = self.planner.retrieve(cur_status)
+        rag_docs = retrieve_documents(self.retriever, cur_status, self.target_labels)
         rag_docs_formatted = format_docs(rag_docs) if rag_docs else ""
         prompt = self._create_prompt(cur_status, rag_docs_formatted)
         
@@ -329,7 +828,6 @@ if __name__ == "__main__":
     
     print(f"\ncur_status (처음 5개): {list(sample['cur_status'].items())[:5]}")
     print(f"\nrag_docs 개수: {len(sample['rag_docs'])}")
-    print(f"\nrag_docs_formatted 길이: {len(sample['rag_docs_formatted'])}")
-    print(f"\nuser_prompt 길이: {len(sample['user_prompt'])}")
-    print(f"\nuser_prompt (처음 500자):\n{sample['user_prompt']}...")
+    print(f"\nprompt 길이: {len(sample['prompt'])}")
+    print(f"\nprompt (처음 500자):\n{sample['prompt'][:500]}...")
     print("=" * 50)
